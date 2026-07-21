@@ -40,6 +40,10 @@ struct Args {
     /// Only write the merged JSON; do not start the TUI.
     #[arg(long)]
     no_tui: bool,
+
+    /// Override the machine label for an input. Repeat as NAME=EXPORT.json.
+    #[arg(long = "machine", value_name = "NAME=EXPORT.json")]
+    machine_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -210,12 +214,30 @@ struct ExportFile {
     agents: Vec<AgentExport>,
     #[serde(default)]
     daily: Vec<DailyExport>,
+    #[serde(skip)]
+    machine_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MachineUsage {
+    machine: String,
+    source_file: String,
+    tokens: Tokens,
+    cost: f64,
+    model_count: usize,
+    agent_count: usize,
+    session_count: u64,
+    message_count: u64,
+    turn_count: u64,
+    active_days: usize,
 }
 
 #[derive(Debug, Clone)]
 struct MergedExport {
     models: Vec<ModelExport>,
     agents: Vec<AgentExport>,
+    machines: Vec<MachineUsage>,
     daily: Vec<DailyExport>,
     monthly: Vec<MonthlyExport>,
     total_tokens: u64,
@@ -263,17 +285,28 @@ fn canonical_model(model: &str) -> String {
     }
 }
 
-fn read_files(paths: &[PathBuf]) -> Result<Vec<(PathBuf, ExportFile)>> {
-    paths
+fn read_files(entries: &[(Option<String>, PathBuf)]) -> Result<Vec<(PathBuf, ExportFile)>> {
+    entries
         .iter()
-        .map(|path| {
+        .map(|(machine_label, path)| {
             let text = fs::read_to_string(path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
-            let export = serde_json::from_str(&text)
+            let mut export: ExportFile = serde_json::from_str(&text)
                 .with_context(|| format!("invalid tokscale export JSON: {}", path.display()))?;
+            export.machine_label = machine_label.clone();
             Ok((path.clone(), export))
         })
         .collect()
+}
+
+fn parse_machine_spec(spec: &str) -> Result<(String, PathBuf)> {
+    let (label, path) = spec
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("machine spec must be NAME=EXPORT.json: {spec}"))?;
+    if label.trim().is_empty() || path.trim().is_empty() {
+        bail!("machine spec must contain both NAME and EXPORT.json: {spec}");
+    }
+    Ok((label.trim().to_string(), PathBuf::from(path.trim())))
 }
 
 fn discover_files() -> Result<Vec<PathBuf>> {
@@ -292,7 +325,72 @@ fn discover_files() -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn machine_usage(path: &Path, export: &ExportFile) -> MachineUsage {
+    let machine = export.machine_label.clone().unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown-machine")
+            .to_string()
+    });
+    let source_file = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown.json")
+        .to_string();
+
+    let mut tokens = Tokens::default();
+    let mut cost = 0.0;
+    let mut session_count: u64 = 0;
+    if export.models.is_empty() {
+        for day in &export.daily {
+            tokens.add_assign(&day.tokens);
+            cost += clean_cost(day.cost);
+        }
+    } else {
+        for model in &export.models {
+            tokens.add_assign(&model.tokens);
+            cost += clean_cost(model.cost);
+            session_count = session_count.saturating_add(model.session_count);
+        }
+    }
+    tokens.total = tokens.effective_total();
+
+    let mut message_count: u64 = 0;
+    let mut turn_count: u64 = 0;
+    let mut active_days: usize = 0;
+    for day in &export.daily {
+        message_count = message_count.saturating_add(day.message_count);
+        turn_count = turn_count.saturating_add(day.turn_count);
+        if day.tokens.effective_total() > 0 || day.cost > 0.0 || day.message_count > 0 {
+            active_days += 1;
+        }
+    }
+
+    MachineUsage {
+        machine,
+        source_file,
+        tokens,
+        cost,
+        model_count: export.models.len(),
+        agent_count: export.agents.len(),
+        session_count,
+        message_count,
+        turn_count,
+        active_days,
+    }
+}
+
 fn merge_exports(files: &[(PathBuf, ExportFile)]) -> MergedExport {
+    let mut machines = files
+        .iter()
+        .map(|(path, export)| machine_usage(path, export))
+        .collect::<Vec<_>>();
+    machines.sort_by(|a, b| {
+        clean_cost(b.cost)
+            .total_cmp(&clean_cost(a.cost))
+            .then_with(|| a.machine.cmp(&b.machine))
+    });
+
     let mut models: BTreeMap<String, ModelExport> = BTreeMap::new();
     let mut agents: BTreeMap<String, AgentExport> = BTreeMap::new();
     let mut daily: BTreeMap<String, DailyExport> = BTreeMap::new();
@@ -410,6 +508,7 @@ fn merge_exports(files: &[(PathBuf, ExportFile)]) -> MergedExport {
     MergedExport {
         models,
         agents,
+        machines,
         daily,
         monthly,
         total_tokens,
@@ -422,6 +521,7 @@ fn write_merged_export(path: &Path, merged: &MergedExport) -> Result<()> {
     let json = serde_json::json!({
         "models": merged.models,
         "agents": merged.agents,
+        "machines": merged.machines,
         "daily": merged.daily,
         "monthly": merged.monthly,
         "totals": {
@@ -469,6 +569,7 @@ enum ViewTab {
     Overview,
     Daily,
     Monthly,
+    Machines,
 }
 
 impl ViewTab {
@@ -476,15 +577,17 @@ impl ViewTab {
         match self {
             Self::Overview => Self::Daily,
             Self::Daily => Self::Monthly,
-            Self::Monthly => Self::Overview,
+            Self::Monthly => Self::Machines,
+            Self::Machines => Self::Overview,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Self::Overview => Self::Monthly,
+            Self::Overview => Self::Machines,
             Self::Daily => Self::Overview,
             Self::Monthly => Self::Daily,
+            Self::Machines => Self::Monthly,
         }
     }
 
@@ -493,6 +596,7 @@ impl ViewTab {
             Self::Overview => "Overview",
             Self::Daily => "Daily",
             Self::Monthly => "Monthly",
+            Self::Machines => "Machines",
         }
     }
 }
@@ -625,6 +729,7 @@ fn draw_tui(
                     KeyCode::Char('1') => tab = ViewTab::Overview,
                     KeyCode::Char('2') => tab = ViewTab::Daily,
                     KeyCode::Char('3') => tab = ViewTab::Monthly,
+                    KeyCode::Char('4') => tab = ViewTab::Machines,
                     KeyCode::Tab | KeyCode::Right => tab = tab.next(),
                     KeyCode::BackTab | KeyCode::Left => tab = tab.previous(),
                     _ => {}
@@ -676,12 +781,14 @@ fn render(
             render_stats(
                 frame,
                 rows[1],
-                "ALL-TIME",
-                &all_tokens,
-                merged.total_cost,
-                graph.summary.active_days as usize,
-                "MODELS",
-                merged.models.len().to_string(),
+                StatsView {
+                    period: "ALL-TIME",
+                    tokens: &all_tokens,
+                    cost: merged.total_cost,
+                    active_days: graph.summary.active_days as usize,
+                    detail_label: "MODELS",
+                    detail_value: merged.models.len().to_string(),
+                },
             );
             let middle = Layout::default()
                 .direction(Direction::Horizontal)
@@ -697,12 +804,14 @@ fn render(
             render_stats(
                 frame,
                 rows[1],
-                "LAST 30 DAYS",
-                &totals.tokens,
-                totals.cost,
-                totals.active_days,
-                "AVG/DAY",
-                format!("${:.2}", totals.cost / totals.active_days.max(1) as f64),
+                StatsView {
+                    period: "LAST 30 DAYS",
+                    tokens: &totals.tokens,
+                    cost: totals.cost,
+                    active_days: totals.active_days,
+                    detail_label: "AVG/DAY",
+                    detail_value: format!("${:.2}", totals.cost / totals.active_days.max(1) as f64),
+                },
             );
             render_daily_tab(frame, rows[2], rows[3], &days, &totals, merged);
         }
@@ -711,14 +820,35 @@ fn render(
             render_stats(
                 frame,
                 rows[1],
-                "ALL MONTHS",
-                &totals.tokens,
-                totals.cost,
-                totals.active_days,
-                "MONTHS",
-                merged.monthly.len().to_string(),
+                StatsView {
+                    period: "ALL MONTHS",
+                    tokens: &totals.tokens,
+                    cost: totals.cost,
+                    active_days: totals.active_days,
+                    detail_label: "MONTHS",
+                    detail_value: merged.monthly.len().to_string(),
+                },
             );
             render_monthly_tab(frame, rows[2], rows[3], &merged.monthly, &totals, merged);
+        }
+        ViewTab::Machines => {
+            let all_tokens = Tokens {
+                total: merged.total_tokens,
+                ..Tokens::default()
+            };
+            render_stats(
+                frame,
+                rows[1],
+                StatsView {
+                    period: "ALL MACHINES",
+                    tokens: &all_tokens,
+                    cost: merged.total_cost,
+                    active_days: graph.summary.active_days as usize,
+                    detail_label: "MACHINES",
+                    detail_value: merged.machines.len().to_string(),
+                },
+            );
+            render_machine_tab(frame, rows[2], rows[3], merged);
         }
     }
 
@@ -731,7 +861,7 @@ fn render(
         ),
         Span::raw("quit  "),
         Span::styled("•", Style::default().fg(Color::DarkGray)),
-        Span::raw("  1 overview  2 daily  3 monthly  "),
+        Span::raw("  1 overview  2 daily  3 monthly  4 machines  "),
         Span::styled("•", Style::default().fg(Color::DarkGray)),
         Span::raw("  arrows/tab switch  "),
         Span::styled("•", Style::default().fg(Color::DarkGray)),
@@ -741,7 +871,12 @@ fn render(
 }
 
 fn render_nav(frame: &mut Frame<'_>, area: Rect, active: ViewTab) {
-    let tabs = [ViewTab::Overview, ViewTab::Daily, ViewTab::Monthly];
+    let tabs = [
+        ViewTab::Overview,
+        ViewTab::Daily,
+        ViewTab::Monthly,
+        ViewTab::Machines,
+    ];
     let mut spans = Vec::new();
     for (index, tab) in tabs.into_iter().enumerate() {
         if index > 0 {
@@ -763,16 +898,16 @@ fn render_nav(frame: &mut Frame<'_>, area: Rect, active: ViewTab) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_stats(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    period: &str,
-    tokens: &Tokens,
+struct StatsView<'a> {
+    period: &'a str,
+    tokens: &'a Tokens,
     cost: f64,
     active_days: usize,
-    detail_label: &str,
+    detail_label: &'a str,
     detail_value: String,
-) {
+}
+
+fn render_stats(frame: &mut Frame<'_>, area: Rect, summary: StatsView<'_>) {
     let layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -784,21 +919,25 @@ fn render_stats(
         .split(area);
     let stats = [
         (
-            format!("{period} TOKENS"),
-            format_tokens(tokens.effective_total()),
+            format!("{} TOKENS", summary.period),
+            format_tokens(summary.tokens.effective_total()),
             Color::Cyan,
         ),
         (
-            format!("{period} SPEND"),
-            format!("${cost:.2}"),
+            format!("{} SPEND", summary.period),
+            format!("${:.2}", summary.cost),
             Color::Green,
         ),
         (
             "ACTIVE DAYS".to_string(),
-            active_days.to_string(),
+            summary.active_days.to_string(),
             Color::Yellow,
         ),
-        (detail_label.to_string(), detail_value, Color::Magenta),
+        (
+            summary.detail_label.to_string(),
+            summary.detail_value,
+            Color::Magenta,
+        ),
     ];
     for (slot, (label, value, color)) in layout.iter().zip(stats) {
         let block = Block::default()
@@ -912,6 +1051,116 @@ fn render_monthly_tab(
         &totals.tokens,
     );
     render_model_breakdown(frame, breakdown_area, merged);
+}
+
+fn render_machine_tab(
+    frame: &mut Frame<'_>,
+    graph_area: Rect,
+    breakdown_area: Rect,
+    merged: &MergedExport,
+) {
+    let panels = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(graph_area);
+    render_machine_metric(
+        frame,
+        panels[0],
+        " MACHINE SPEND ",
+        &merged.machines,
+        |machine| clean_cost(machine.cost),
+        Color::Green,
+        |machine| format!("${:.2}", clean_cost(machine.cost)),
+    );
+    render_machine_metric(
+        frame,
+        panels[1],
+        " MACHINE TOKENS ",
+        &merged.machines,
+        |machine| machine.tokens.effective_total() as f64,
+        Color::Cyan,
+        |machine| format_tokens(machine.tokens.effective_total()),
+    );
+
+    let block = Block::default()
+        .title(" MACHINE DETAIL · SOURCE FILES ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(breakdown_area);
+    frame.render_widget(block, breakdown_area);
+    let lines = merged
+        .machines
+        .iter()
+        .take(4)
+        .map(|machine| {
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{:<22}",
+                        machine.machine.chars().take(21).collect::<String>()
+                    ),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::styled(
+                    format!(
+                        " {:>3}d  {:>5} models  {:>7} msgs",
+                        machine.active_days, machine.model_count, machine.message_count
+                    ),
+                    Style::default().fg(Color::White),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+fn render_machine_metric<F, V>(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    machines: &[MachineUsage],
+    value: F,
+    color: Color,
+    value_label: V,
+) where
+    F: Fn(&MachineUsage) -> f64,
+    V: Fn(&MachineUsage) -> String,
+{
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let max_value = machines.iter().map(&value).fold(0.0_f64, f64::max);
+    let bar_width = inner.width.saturating_sub(32) as usize;
+    let lines = machines
+        .iter()
+        .take(8)
+        .map(|machine| {
+            let current = value(machine);
+            let filled = if max_value <= 0.0 {
+                0
+            } else {
+                ((current / max_value) * bar_width as f64).round() as usize
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{:<18}",
+                        machine.machine.chars().take(17).collect::<String>()
+                    ),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::styled("█".repeat(filled), Style::default().fg(color)),
+                Span::styled(
+                    format!(" {:>10}", value_label(machine)),
+                    Style::default().fg(Color::White),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 fn render_sparkline(frame: &mut Frame<'_>, area: Rect, title: &str, data: &[u64], color: Color) {
@@ -1156,12 +1405,23 @@ fn run_tui(merged: &MergedExport) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let paths = if args.files.is_empty() {
-        discover_files()?
+    if !args.machine_files.is_empty() && !args.files.is_empty() {
+        bail!("use positional exports or --machine NAME=EXPORT.json, not both");
+    }
+    let entries = if !args.machine_files.is_empty() {
+        args.machine_files
+            .iter()
+            .map(|spec| parse_machine_spec(spec).map(|(label, path)| (Some(label), path)))
+            .collect::<Result<Vec<_>>>()?
     } else {
-        args.files
+        let paths = if args.files.is_empty() {
+            discover_files()?
+        } else {
+            args.files
+        };
+        paths.into_iter().map(|path| (None, path)).collect()
     };
-    let files = read_files(&paths)?;
+    let files = read_files(&entries)?;
     let merged = merge_exports(&files);
     write_merged_export(&args.output, &merged)?;
 
@@ -1210,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_overview_daily_and_monthly_tabs() {
+    fn renders_overview_daily_monthly_and_machine_tabs() {
         use ratatui::{backend::TestBackend, Terminal};
 
         let daily = DailyExport {
@@ -1223,6 +1483,14 @@ mod tests {
         let merged = MergedExport {
             models: Vec::new(),
             agents: Vec::new(),
+            machines: vec![MachineUsage {
+                machine: "test-machine".into(),
+                source_file: "test.json".into(),
+                tokens: tokens(100),
+                cost: 2.0,
+                active_days: 1,
+                ..MachineUsage::default()
+            }],
             daily: vec![daily],
             monthly: vec![MonthlyExport {
                 month: "2026-01".into(),
@@ -1241,7 +1509,12 @@ mod tests {
             Ok(terminal) => terminal,
             Err(error) => panic!("test backend should initialize: {error}"),
         };
-        for tab in [ViewTab::Overview, ViewTab::Daily, ViewTab::Monthly] {
+        for tab in [
+            ViewTab::Overview,
+            ViewTab::Daily,
+            ViewTab::Monthly,
+            ViewTab::Machines,
+        ] {
             assert!(
                 terminal
                     .draw(|frame| render(frame, &merged, &graph, &weeks, tab))
@@ -1311,6 +1584,10 @@ mod tests {
         ];
 
         let merged = merge_exports(&files);
+        assert_eq!(merged.machines.len(), 2);
+        assert_eq!(merged.machines[0].machine, "b");
+        assert_eq!(merged.machines[0].tokens.total, 20);
+        assert_eq!(merged.machines[0].message_count, 5);
         assert_eq!(merged.models.len(), 1);
         assert_eq!(merged.models[0].tokens.total, 30);
         assert_eq!(merged.models[0].client, "codex, pi");
