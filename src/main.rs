@@ -697,8 +697,20 @@ fn format_tokens(tokens: u64) -> String {
     if unit == 0 {
         tokens.to_string()
     } else {
-        format!("{value:.1}{}", UNITS[unit])
+        format!("{value:.2}{}", UNITS[unit])
     }
+}
+
+fn compact_label(label: &str, max_chars: usize) -> String {
+    let chars = label.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return label.to_string();
+    }
+    let suffix_len = max_chars.saturating_sub(1);
+    let suffix = chars[chars.len().saturating_sub(suffix_len)..]
+        .iter()
+        .collect::<String>();
+    format!("…{suffix}")
 }
 
 fn heat_color(intensity: u8) -> Color {
@@ -1095,10 +1107,7 @@ fn render_machine_tab(
         .map(|machine| {
             Line::from(vec![
                 Span::styled(
-                    format!(
-                        "{:<22}",
-                        machine.machine.chars().take(21).collect::<String>()
-                    ),
+                    format!("{:<22}", compact_label(&machine.machine, 22)),
                     Style::default().fg(Color::Gray),
                 ),
                 Span::styled(
@@ -1146,10 +1155,7 @@ fn render_machine_metric<F, V>(
             };
             Line::from(vec![
                 Span::styled(
-                    format!(
-                        "{:<18}",
-                        machine.machine.chars().take(17).collect::<String>()
-                    ),
+                    format!("{:<18}", compact_label(&machine.machine, 18)),
                     Style::default().fg(Color::Gray),
                 ),
                 Span::styled("█".repeat(filled), Style::default().fg(color)),
@@ -1467,6 +1473,15 @@ mod tests {
             total,
             ..Tokens::default()
         }
+    }
+
+    #[test]
+    fn compact_machine_labels_keep_timestamp_suffixes_distinct() {
+        let first = compact_label("tokscale-export-20260721-011850", 18);
+        let second = compact_label("tokscale-export-20260721-022516", 18);
+        assert_ne!(first, second);
+        assert_eq!(format_tokens(25_554_358_232), "25.55B");
+        assert_eq!(format_tokens(25_580_375_448), "25.58B");
     }
 
     #[test]
