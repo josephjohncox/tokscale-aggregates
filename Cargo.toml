@@ -12,4 +12,4 @@ crossterm = "0.29"
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokscale-core = { git = "https://github.com/junhoyeo/tokscale.git", tag = "v4.5.3" }
+tokscale-core = { git = "https://github.com/junhoyeo/tokscale.git", tag = "v4.17.0" }
